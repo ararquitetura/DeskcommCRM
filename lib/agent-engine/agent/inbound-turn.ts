@@ -1,3 +1,5 @@
+import { consultarFonteObrigatoria, textoAutorizadoPelaFonte, blocoDaFonte, RESPOSTA_SEM_DADOS, type FonteVerificada } from '@/lib/mcp/servidor-externo/consulta-obrigatoria';
+import { limitarFerramentasDaFonte } from '@/lib/mcp/servidor-externo/efeitos-da-fonte';
 import { contemAssuntoComercialNaSaida, contemAssuntoComercialRestrito, comercialExigeHumano } from '@/lib/escalacao/assunto-comercial';
 import { prospectingConversationContext } from "@/lib/prospecting/context";
 import { setExecutionAgentOperation } from '@/lib/atendimento/fronteira-server';
@@ -356,9 +358,11 @@ import {
 import type { DependenciasDoPonto } from '@/lib/ai/decisao/ponto';
 import { perguntarUrgenciaAoJev, registrarUrgenciaDoJev } from '@/lib/ai/decisao/urgencia';
 import { fatosDaOrganizacao } from './fatos-da-organizacao';
+import { traduzir } from '@/lib/i18n/dicionario';
 import { fusoDaOrganizacao } from './fuso-da-org';
 import { blocoDoFeriado, ehFeriadoNacionalNoFuso, lerFeriadoDoTurno } from './feriado-nacional';
 import { blocosNoIdioma, diretivaDeIdioma, ferramentasNoIdioma } from './idioma-do-turno';
+import type { Idioma } from './idioma-do-turno';
 import { renderAgora } from '@/lib/tempo/agora';
 import { decidirElegibilidadeDaConversa } from '@/lib/ai/elegibilidade/consulta-pg';
 import {
@@ -1180,8 +1184,9 @@ async function briefingDoCheckpointDuravel(
   leadId: string,
   log: Logger,
 ): Promise<BriefingDaPassagem> {
+  const idioma = (await fatosDaOrganizacao(pool, tenantId, log)).idioma;
   const montar = (checkpoint: Awaited<ReturnType<typeof latestCheckpoint>>) =>
-    montarBriefingDaPassagem({ checkpoint, motivo: { codigo: 'orcamento_de_ia' } });
+    montarBriefingDaPassagem({ checkpoint, motivo: { codigo: 'orcamento_de_ia' }, idioma });
   try {
     return montar(await latestCheckpoint(pool, tenantId, leadId));
   } catch (err) {
@@ -1539,6 +1544,68 @@ export function blocosDeInteresseExternoResidentes(toolIds: readonly string[]): 
   return toolIds.includes('crm_consultar_receita') && toolIds.includes('crm_create_lead')
     ? [INTERESSE_EXTERNO_SYSTEM_BLOCK]
     : [];
+}
+
+/**
+ * OS BLOCOS FIXOS DA PLATAFORMA — os primeiros bytes do `system` (#4668).
+ *
+ * São idênticos para todo agente de toda instalação: não dependem do prompt do
+ * dono, das ferramentas publicadas, do idioma da organização nem do turno. Por
+ * isso vêm ANTES de tudo o que pode variar — é o único trecho que o cache de
+ * prefixo do provedor consegue reaproveitar entre agentes diferentes.
+ */
+export const BLOCOS_FIXOS_DA_PLATAFORMA: readonly string[] = [
+  TRANSPARENCIA_SYSTEM_BLOCK,
+  AUTORIA_SYSTEM_BLOCK,
+];
+
+export interface BlocosDoSistemaDoTurno {
+  /** `composeSystemPrompt(playbook, memória da org, índice de skills)` — a parte do agente. */
+  promptDoAgente: string;
+  casosLigados: boolean;
+  toolIds: readonly string[];
+  previewKind: TurnPreview['kind'] | null;
+  idioma: Idioma;
+  blocoDaVoz: string | null;
+}
+
+/**
+ * A ORDEM DO `system` — e a ordem é dinheiro, não estilo (#4668).
+ *
+ * O cache de prefixo dos provedores só reaproveita o começo IGUAL do pedido. Com
+ * o prompt do agente na frente, cada agente diferente — e cada edição do prompt
+ * de um deles — invalidava também os blocos da plataforma, que são iguais para
+ * todos. Aqui a montagem obedece a quatro faixas, da mais estável para a mais
+ * volátil:
+ *
+ *   1. fixo da plataforma (`BLOCOS_FIXOS_DA_PLATAFORMA`): mesmos bytes em toda
+ *      instalação;
+ *   2. por-agente, do mais estável ao menos: o que a TELA habilita (casos,
+ *      agenda, interesse no banco externo) muda quando o dono mexe nas ferramentas; o prompt muda quando ele
+ *      reescreve o texto, e aí só invalida daqui para baixo;
+ *   3. por-turno (prévia, voz): tudo o que pode mudar entre dois turnos do MESMO
+ *      agente fica no fim.
+ *
+ * A diretiva de idioma é a EXCEÇÃO, e fecha o `system`: o texto dela diz "mesmo
+ * que as regras ACIMA estejam em português", e isso só é verdade se tudo o mais
+ * estiver acima dela. Na frente ela mentiria sobre o que está acima dela. É também
+ * a posição que ela já tinha antes desta reordenação. É curta: o que ela custa ao
+ * cache é só ela mesma.
+ *
+ * A regra que este arquivo não pode perder: bloco novo entra na faixa dele, e
+ * nada volátil (relógio, lead, contador) entra aqui — o por-turno tem sufixo
+ * próprio, depois do breakpoint.
+ */
+export function blocosDoSistemaDoTurno(input: BlocosDoSistemaDoTurno): string[] {
+  const blocos: string[] = [...BLOCOS_FIXOS_DA_PLATAFORMA];
+  if (input.casosLigados) blocos.push(CASES_SYSTEM_BLOCK);
+  blocos.push(...blocosDeAgendaResidentes(input.toolIds));
+  blocos.push(...blocosDeInteresseExternoResidentes(input.toolIds));
+  blocos.push(input.promptDoAgente);
+  if (input.previewKind !== null) blocos.push(blocoDoModoDePrevia(input.previewKind));
+  if (input.blocoDaVoz !== null) blocos.push(input.blocoDaVoz);
+  blocos.push(diretivaDeIdioma(input.idioma));
+  return blocos;
 }
 
 /**
@@ -2336,6 +2403,7 @@ export async function deteccoesDeterministicasDoAssistido(
       checkpoint: await latestCheckpoint(pool, tenantId, leadId),
       pendentesDoCliente: inboundsPendentes,
       motivo: { codigo: 'requested_human' },
+      idioma: (await fatosDaOrganizacao(pool, tenantId, log)).idioma,
     });
     const aviso = avisoDaEscalacao();
     const desfecho = contextoLido
@@ -2369,6 +2437,7 @@ export async function deteccoesDeterministicasDoAssistido(
       checkpoint: await latestCheckpoint(pool, tenantId, leadId),
       pendentesDoCliente: inboundsPendentes,
       motivo: { codigo: 'suspected_optout' },
+      idioma: (await fatosDaOrganizacao(pool, tenantId, log)).idioma,
     });
     const aviso = avisoDaEscalacao();
     const desfecho = contextoLido
@@ -2667,8 +2736,10 @@ async function escalarComercialAntesDoModelo(
       ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
     },
   );
+  const idiomaDoTurno = (await fatosDaOrganizacao(pool, tenantId)).idioma;
   const briefing = montarBriefingDaPassagem({ checkpoint: null, pendentesDoCliente: textos,
-    motivo: { codigo: 'restricao_comercial', texto: 'Valores e negociação: fora do escopo da IA.' } });
+    motivo: { codigo: 'restricao_comercial', texto: traduzir('Valores e negociação: fora do escopo da IA.', idiomaDoTurno) },
+    idioma: idiomaDoTurno });
   await performHumanHandoff(pool, { tenantId, leadId: turno.leadId, conversationId: turno.conversationId },
     { reason: 'restricao_comercial', conversationSummary: briefing.body,
       inboxTitle: 'Valores e negociação — atendimento humano necessário',
@@ -2951,6 +3022,17 @@ async function executarTurnoDoAgente(
         inbound: liveJob().kind === 'inbound_turn',
       }, { log: runLog, jev: deps.jev });
   const agentConfig = routed.config;
+  let registrarFonteConsultada: (fonte: FonteVerificada | null) => void = () => undefined;
+  const consultarDadosAtuais = async () => {
+    const fonte = agentConfig?.consultaObrigatoriaTool
+      ? await consultarFonteObrigatoria(deps.crmCfg.supabase, {
+        organizationId: tenantId, contactId: leadId || null, conversationId: input.conversationId,
+      }, agentConfig)
+      : null;
+    registrarFonteConsultada(fonte);
+    return fonte;
+  };
+  const fonteObrigatoriaInicial = agentConfig?.consultaObrigatoriaTool ? await consultarDadosAtuais() : null;
   // O traço grava o agente que o turno RESOLVEU: follow-up e resposta de caso
   // não passam `resolvedAgent`, e sem isto a linha ficaria sem agente nem fontes.
   if (input.tracoDoTurno !== undefined) input.tracoDoTurno.desfecho.config = agentConfig;
@@ -3384,32 +3466,10 @@ async function executarTurnoDoAgente(
     orgMemoryBlock: renderOrgMemory(orgMemory),
     skillIndex,
   });
-  // Spec 15 §5.2: bloco das tools de caso SEMPRE residente (não invalida o prefixo
-  // cacheável — mesmo espírito do índice de skills) quando a tela habilita. O bloco da
-  // Agenda segue o mesmo padrão, condicionado a `crm_book_appointment` estar entre as
-  // tools publicadas — ver comentário de `agendaSystemBlock`. `TRANSPARENCIA_SYSTEM_BLOCK`
-  // e `AUTORIA_SYSTEM_BLOCK` não dependem de nenhuma feature — todo agente publicado os recebe.
-  const blocosResidentes = [systemWithMemory, TRANSPARENCIA_SYSTEM_BLOCK, AUTORIA_SYSTEM_BLOCK];
-  if (agentConfig !== null && agentConfig.casesEnabled) blocosResidentes.push(CASES_SYSTEM_BLOCK);
-  // Spec 15 §5.2 / doutrina da Agenda: a régua é o que o agente TEM — ver
-  // `blocosDeAgendaResidentes`, que decidiu isto num lugar só para poder ser
-  // testada (o bloco da cadeia nomeia `crm_list_event_types`, e nomear
-  // ferramenta ausente faz o modelo tentar chamá-la).
-  if (agentConfig !== null) blocosResidentes.push(...blocosDeAgendaResidentes(agentConfig.toolIds));
-  // #3757: o bloco da prévia diz de QUEM é a voz. São duas prévias com donos
-  // diferentes — o "Testar" (sandbox) é do agente falando como agente, mas o
-  // "Sugerir resposta" (assisted) escreve o rascunho que o ATENDENTE humano vai
-  // revisar e enviar. Com um bloco só, o prompt de atendimento automático (que
-  // ensina a passar a vez a uma pessoa) vazava para a caixa do atendente e o
-  // rascunho saía em terceira pessoa — "vou avisar o atendente e ele responde".
-  // Vive em função de módulo (`blocoDoModoDePrevia`) para poder ser testada.
-  if (preview) blocosResidentes.push(blocoDoModoDePrevia(preview.kind));
-  if (agentConfig !== null) blocosResidentes.push(...blocosDeInteresseExternoResidentes(agentConfig.toolIds));
-  // #4260, item 1: o único bloco NOVO é a diretiva de idioma, e ela entra por
-  // último para não deslocar nenhum dos de cima (o prefixo cacheável continua
-  // igual em `pt-BR`). A tradução dos blocos acima acontece DEPOIS da montagem,
-  // numa passada só — ver `blocosNoIdioma`.
-  blocosResidentes.push(diretivaDeIdioma(idiomaDaOrg));
+  // #4668: a montagem e a ORDEM do `system` moraram para
+  // `blocosDoSistemaDoTurno` (logo abaixo de `blocosDeAgendaResidentes`) e
+  // acontecem DEPOIS de a voz ser resolvida — aquela função é a ordem que o
+  // cache de prefixo enxerga, e é lá que um bloco novo escolhe a faixa dele.
   const openingContext = preview
     ? preview.context
     : await lerContextoDaConversa();
@@ -3428,7 +3488,7 @@ async function executarTurnoDoAgente(
   // voz de verdade (e `agent_preview` nem está no menu de `send_message`
   // real; é cinto e suspensório, não redundância morta).
   const vozParaEsteTurno =
-    !preview && agentConfig?.vozEnabled
+    !preview && !agentConfig?.consultaObrigatoriaTool && agentConfig?.vozEnabled
       ? await resolverVozDoTurno({
           pool,
           tenantId,
@@ -3466,12 +3526,21 @@ async function executarTurnoDoAgente(
   // modelo escrevia como sempre — três bolhas, lista e sigla — e a síntese lia
   // tudo numa nota de 35 segundos (medido numa instalação real em 03/11/2026, número
   // oficial). Por isso o `system` só é montado DEPOIS de a voz ser resolvida, e
-  // o bloco vai NO FIM: o prefixo dos turnos em texto continua o mesmo.
+  // o bloco vai no fim (só a diretiva de idioma vem depois): o prefixo dos
+  // turnos em texto continua o mesmo.
   const blocoDaVoz = blocoDaRespostaFalada(vozParaEsteTurno);
-  if (blocoDaVoz) blocosResidentes.push(blocoDaVoz);
-  // #4260, item 1: a passada de idioma vem DEPOIS da montagem — a ordem dos
-  // blocos e o `join` daqui continuam os de antes, e em `pt-BR` cada bloco volta
-  // igual. Mutação local, na mesma lista: o turno não guarda os blocos.
+  const blocosResidentes = blocosDoSistemaDoTurno({
+    promptDoAgente: systemWithMemory,
+    casosLigados: agentConfig !== null && agentConfig.casesEnabled,
+    toolIds: agentConfig?.toolIds ?? [],
+    previewKind: preview?.kind ?? null,
+    idioma: idiomaDaOrg,
+    blocoDaVoz,
+  });
+  // #4260, item 1: a passada de idioma vem DEPOIS da montagem — uma passada só,
+  // por dicionário (chave = o texto em português), nunca um `idioma` por `push`.
+  // Mudar a ORDEM dos blocos não muda esta régua: em `pt-BR` cada bloco volta
+  // igual, e em `es` cada um volta traduzido no mesmo lugar da lista.
   blocosNoIdioma(blocosResidentes, idiomaDaOrg).forEach((bloco, indice) => {
     blocosResidentes[indice] = bloco;
   });
@@ -3566,7 +3635,7 @@ async function executarTurnoDoAgente(
       motivo: 'outro',
     });
     const briefing = montarBriefingDaPassagem({ checkpoint: null, pendentesDoCliente: [],
-      motivo: { codigo: 'restricao_comercial', texto: 'Resposta comercial barrada; valores e negociação são exclusivos da equipe.' } });
+      motivo: { codigo: 'restricao_comercial', texto: traduzir('Resposta comercial barrada; valores e negociação são exclusivos da equipe.', idiomaDaOrg) }, idioma: idiomaDaOrg });
     await performHumanHandoff(pool, { tenantId, leadId, conversationId: input.conversationId },
       { reason: 'restricao_comercial', conversationSummary: briefing.body,
         inboxTitle: 'Valores e negociação — atendimento humano necessário',
@@ -3626,6 +3695,7 @@ async function executarTurnoDoAgente(
       checkpoint: previous,
       pendentesDoCliente: inboundsPendentes,
       motivo: { codigo: 'requested_human' },
+      idioma: idiomaDaOrg,
     });
     await performHumanHandoff(
       pool,
@@ -3665,6 +3735,7 @@ async function executarTurnoDoAgente(
       checkpoint: previous,
       pendentesDoCliente: inboundsPendentes,
       motivo: { codigo: 'suspected_optout' },
+      idioma: idiomaDaOrg,
     });
     await performHumanHandoff(
       pool,
@@ -4167,6 +4238,16 @@ async function executarTurnoDoAgente(
     return [];
   });
   const evidenciasComerciais = criarEvidenciasComerciaisDoTurno(fontesQueProvamOferta);
+  // A consulta feita PELO EXECUTOR também sustenta o relato do registro no
+  // revisor de promessa. Continua sendo dado externo, nunca política comercial;
+  // os gates e a comparação exata com a fonte fresca permanecem na cadeia.
+  registrarFonteConsultada = (fonte) => {
+    if (fonte && agentConfig?.consultaObrigatoriaTool)
+      evidenciasComerciais.registrarLeituraRemota(agentConfig.consultaObrigatoriaTool, {
+        dados: fonte.respostas_permitidas,
+      });
+  };
+  registrarFonteConsultada(fonteObrigatoriaInicial);
   // `imagem_url` só vale para endereço que uma ferramenta de dados devolveu neste turno.
   const procedenciaDeImagens = criarProcedenciaDeImagens();
   const efeitosDoTurno = criarEfeitoDasEscrituras();
@@ -4714,6 +4795,9 @@ async function executarTurnoDoAgente(
           };
         }
 
+        if (agentConfig?.consultaObrigatoriaTool) return { ok: false, error: {
+          code: 'fonte_obrigatoria', message: 'A fonte obrigatória não autoriza templates. Use uma frase autorizada da consulta atual.',
+        } };
         const rendered = renderTemplateBody(linha.components, values, {
           name: template_name,
           language,
@@ -4857,6 +4941,11 @@ async function executarTurnoDoAgente(
         // para que o corpo vazio, as bolhas e a pausa humana meçam o que sai.
         // Ver `formato-whatsapp.ts`.
         const body = formatarParaWhatsApp(corpoDoModelo);
+        if (agentConfig?.consultaObrigatoriaTool && (
+          !textoAutorizadoPelaFonte(body, await consultarDadosAtuais()) || produto_codigo || imagem_url || material_id
+        )) return { ok: false, error: { code: 'fonte_obrigatoria', message:
+          'Texto sem comprovação na fonte atual. Use exatamente: ' + RESPOSTA_SEM_DADOS,
+        } };
         // Segundo texto com preço depois de um veto comercial sem cliente esperando:
         // nem chama a cadeia — o agente já foi avisado e insistir só gasta o turno.
         if (vetosComerciaisSemPendencia >= 2 && contemAssuntoComercialNaSaida(body)) {
@@ -5417,12 +5506,17 @@ async function executarTurnoDoAgente(
                 // número, e o call site estava cravando `1200 + rand*800` ignorando-a.
                 (pacingDoTurno?.knobs.throttleMs ?? 1200) +
                 Math.floor(Math.random() * (pacingDoTurno?.knobs.jitterMaxMs ?? 800));
-              const enviar = (
+              const enviar = async (
                 corpo: string,
                 media?: FotoParaEnvio,
               ): Promise<ChannelSendResult> => {
-                seq += 1;
-                return liveChannel().send({
+                  if (agentConfig?.consultaObrigatoriaTool &&
+                      (media || !textoAutorizadoPelaFonte(corpo, await consultarDadosAtuais()))) {
+                    runLog.warn('envio vetado pela fonte obrigatória após formatação');
+                    return { kind: 'unavailable', reason: 'fonte_obrigatoria' } as const;
+                  }
+                  seq += 1;
+                  return liveChannel().send({
                   tenantId,
                   leadId,
                   jobId: liveJob().id,
@@ -5435,7 +5529,7 @@ async function executarTurnoDoAgente(
                   // Só a bolha QUE CARREGA o arquivo leva o id do material: é o
                   // metadata que faz os freios de reenvio contarem uma vez.
                   ...(media && materialApresentado ? { materialId: materialApresentado } : {}),
-                });
+                  });
               };
               // Saída configurável da prospecção (fora de prévia); ver saida-configuravel.ts.
               const saida = { db: pool, organizationId: tenantId, conversationId: preview ? null : input.conversationId, via: "inbound_turn" as const, mensagem: { jobId: preview ? "" : liveJob().id, seq: seq + 1 }, avisar: (m: string, c: Record<string, unknown>) => runLog.warn(m, c) };
@@ -5455,7 +5549,7 @@ async function executarTurnoDoAgente(
                       enviarTexto: (texto) =>
                         enviarVoz(texto) ??
                         sendInBubbles(texto, {
-                          enabled: agentConfig?.splitMessages ?? false,
+                          enabled: !agentConfig?.consultaObrigatoriaTool && (agentConfig?.splitMessages ?? false),
                           maxChars: agentConfig?.splitMaxChars ?? 600,
                           // O teto do turno vale para as bolhas: o que passa dele vai
                           // junto na última.
@@ -5846,6 +5940,7 @@ async function executarTurnoDoAgente(
                 detalhe: mirror.detail,
                 etapaDeDestino: update.transition.to,
                 ...(mirror.stageName !== undefined ? { etapaDoFunil: mirror.stageName } : {}),
+                idioma: idiomaDaOrg,
               });
             }
           }
@@ -5985,7 +6080,7 @@ async function executarTurnoDoAgente(
             pool,
             { tenantId, leadId, conversationId: input.conversationId },
             {
-              conversationSummary: buildHandoffSummary(previous),
+              conversationSummary: buildHandoffSummary(previous, idiomaDaOrg),
               contextoDoTurno: { checkpoint: previous, pendentesDoCliente: inboundsPendentes },
               avisoAoLead: aviso,
               // #2210: com a mensagem na mão o handoff pergunta ao banco se a
@@ -6285,7 +6380,7 @@ async function executarTurnoDoAgente(
   // abaixo). Calculado aqui, antes da ponte MCP, porque a ponte precisa saber quais
   // nativas FICAM: a do catálogo coberta por uma nativa (COBERTA_PELA_NATIVA) só sai
   // quando essa nativa está no turno — senão o Conversador perderia as duas.
-  const entregues = capacidadesEntreguesAoOperador({
+    const entregues = capacidadesEntreguesAoOperador({
     operadorLigado: agentConfig?.operatorEnabled ?? false,
     ferramentasDoOperador: agentConfig?.operatorToolIds ?? [],
   });
@@ -6560,6 +6655,10 @@ async function executarTurnoDoAgente(
 
     // Circuit breaker de tools (F2-15): estado no closure DESTA invocação — zera
     // entre runs por construção (mesma garantia de isolamento do resto do run).
+    if (agentConfig?.consultaObrigatoriaTool) {
+      const permitidas = limitarFerramentasDaFonte(rawTools, agentConfig.consultaObrigatoriaTool);
+      for (const nome of Object.keys(rawTools)) if (!(nome in permitidas)) delete rawTools[nome];
+    }
     if (preview && rawTools.get_lead_note)
       rawTools.get_lead_note = {
         ...rawTools.get_lead_note,
@@ -6655,6 +6754,9 @@ async function executarTurnoDoAgente(
                 canal: canalDoTurno,
                 clientePediu: true,
               }),
+            agentConfig?.consultaObrigatoriaTool
+              ? async (body) => textoAutorizadoPelaFonte(formatarParaWhatsApp(body), await consultarDadosAtuais())
+              : undefined,
           )
         : rawTools;
     const breakerTools = wrapToolsWithBreaker(previewTools, {
@@ -6978,6 +7080,7 @@ async function executarTurnoDoAgente(
     );
     const openingSuffixes = [
       agoraBlock,
+      agentConfig?.consultaObrigatoriaTool ? blocoDaFonte(fonteObrigatoriaInicial) : "",
       feriadoBlock,
       matchedSkillsBlock,
       stageHintBlock,
@@ -7454,6 +7557,7 @@ async function executarTurnoDoAgente(
             // sai (segue pendente para o turno seguinte). Também vigia o teto
             // de mensagens físicas do turno (F2-15b).
             if (!perguntaDoRoteiroPodeSair({ turnoDescartado, seq, maxSendsPerTurn })) return false;
+            if (agentConfig?.consultaObrigatoriaTool && !textoAutorizadoPelaFonte(texto, await consultarDadosAtuais())) return false;
             const chain = await runBeforeSend({
               pool,
               log: runLog,
@@ -7735,6 +7839,7 @@ async function executarTurnoDoAgente(
           }
         : null,
       content,
+      idiomaDaOrg,
     );
 
     if (mudanca.emit) {
